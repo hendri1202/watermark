@@ -3,8 +3,7 @@
    Design System & Global Styles
    ============================================ */
 
-/* --- Google Font Import --- */
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
+/* --- Google Font loaded via <link> in layout.js for better performance --- */
 
 /* --- Design Tokens (CSS Custom Properties) --- */
 :root {
@@ -26,8 +25,9 @@
   --text-tertiary: #4a4a66;
   --text-accent: #a78bfa;
 
-  /* Typography */
-  --font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  /* Typography — emoji fallbacks ensure 💧🖼️✏️ render correctly on all platforms */
+  --font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
 
   /* Spacing */
   --radius-sm: 8px;
