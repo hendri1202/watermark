@@ -1,60 +1,101 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
+import JSZip from "jszip";
+
+/**
+ * Status for each image in the batch:
+ * - idle: uploaded, waiting to process
+ * - processing: currently being watermarked
+ * - done: watermark applied successfully
+ * - error: something went wrong
+ */
+const STATUS = {
+  IDLE: "idle",
+  PROCESSING: "processing",
+  DONE: "done",
+  ERROR: "error",
+};
 
 export default function Home() {
-  // --- State Management ---
-  const [file, setFile] = useState(null);
-  const [originalPreview, setOriginalPreview] = useState(null);
+  // --- State ---
+  // Each image entry: { id, file, originalUrl, resultUrl, resultBlob, status, error }
+  const [images, setImages] = useState([]);
   const [watermarkText, setWatermarkText] = useState("");
   const [opacity, setOpacity] = useState(0.15);
   const [rotation, setRotation] = useState(-30);
   const [spacing, setSpacing] = useState(200);
-  const [resultUrl, setResultUrl] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState(null);
   const [isDragActive, setIsDragActive] = useState(false);
+  const [isZipping, setIsZipping] = useState(false);
 
   const fileInputRef = useRef(null);
+  let idCounter = useRef(0);
 
-  // --- File Handling ---
-  const handleFileSelect = useCallback((selectedFile) => {
-    if (!selectedFile) return;
+  // --- File Handling (supports multiple) ---
+  const addFiles = useCallback((fileList) => {
+    const validTypes = [
+      "image/jpeg", "image/png", "image/webp",
+      "image/gif", "image/tiff", "image/avif",
+    ];
+    const MAX_SIZE = 10 * 1024 * 1024; // 10MB per file
 
-    // Validate file type
-    const validTypes = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/tiff", "image/avif"];
-    if (!validTypes.includes(selectedFile.type)) {
-      setError("Please upload a valid image file (JPEG, PNG, WebP, GIF, TIFF, or AVIF).");
+    const newImages = [];
+
+    for (const file of Array.from(fileList)) {
+      if (!validTypes.includes(file.type)) {
+        continue; // skip invalid files silently
+      }
+      if (file.size > MAX_SIZE) {
+        continue; // skip oversized files
+      }
+
+      idCounter.current += 1;
+      newImages.push({
+        id: `img-${Date.now()}-${idCounter.current}`,
+        file,
+        originalUrl: URL.createObjectURL(file),
+        resultUrl: null,
+        resultBlob: null,
+        status: STATUS.IDLE,
+        error: null,
+      });
+    }
+
+    if (newImages.length === 0 && fileList.length > 0) {
+      setError("No valid images found. Supported: JPEG, PNG, WebP, GIF, TIFF, AVIF (max 10MB each).");
       return;
     }
 
-    // Validate file size (10MB)
-    if (selectedFile.size > 10 * 1024 * 1024) {
-      setError("Image is too large. Maximum size is 10MB.");
-      return;
-    }
-
-    setFile(selectedFile);
     setError(null);
-    setResultUrl(null);
-
-    // Create preview URL for the original image
-    const previewUrl = URL.createObjectURL(selectedFile);
-    setOriginalPreview(previewUrl);
+    setImages((prev) => [...prev, ...newImages]);
   }, []);
 
   const handleFileInputChange = (e) => {
-    handleFileSelect(e.target.files?.[0]);
+    if (e.target.files?.length) {
+      addFiles(e.target.files);
+    }
+    // Reset input so same files can be re-selected
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const handleRemoveFile = () => {
-    setFile(null);
-    setOriginalPreview(null);
-    setResultUrl(null);
+  const removeImage = (id) => {
+    setImages((prev) => {
+      const img = prev.find((i) => i.id === id);
+      if (img?.originalUrl) URL.revokeObjectURL(img.originalUrl);
+      if (img?.resultUrl) URL.revokeObjectURL(img.resultUrl);
+      return prev.filter((i) => i.id !== id);
+    });
+  };
+
+  const clearAll = () => {
+    images.forEach((img) => {
+      if (img.originalUrl) URL.revokeObjectURL(img.originalUrl);
+      if (img.resultUrl) URL.revokeObjectURL(img.resultUrl);
+    });
+    setImages([]);
     setError(null);
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
   };
 
   // --- Drag & Drop ---
@@ -79,63 +120,142 @@ export default function Home() {
     e.preventDefault();
     e.stopPropagation();
     setIsDragActive(false);
-    handleFileSelect(e.dataTransfer.files?.[0]);
+    if (e.dataTransfer.files?.length) {
+      addFiles(e.dataTransfer.files);
+    }
   };
 
-  // --- Submit / Apply Watermark ---
-  const handleSubmit = async () => {
-    if (!file || !watermarkText.trim()) {
-      setError("Please upload an image and enter watermark text.");
+  // --- Process a single image ---
+  const processOneImage = async (imageEntry) => {
+    const formData = new FormData();
+    formData.append("image", imageEntry.file);
+    formData.append("text", watermarkText.trim());
+    formData.append("opacity", opacity.toString());
+    formData.append("rotation", rotation.toString());
+    formData.append("spacing", spacing.toString());
+
+    const response = await fetch("/api/watermark", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      throw new Error(data?.error || `Error (${response.status})`);
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    return { url, blob };
+  };
+
+  // --- Batch Process All ---
+  const handleProcessAll = async () => {
+    if (images.length === 0 || !watermarkText.trim()) {
+      setError("Please add images and enter watermark text.");
       return;
     }
 
-    setLoading(true);
+    setIsProcessing(true);
     setError(null);
-    setResultUrl(null);
 
-    try {
-      const formData = new FormData();
-      formData.append("image", file);
-      formData.append("text", watermarkText.trim());
-      formData.append("opacity", opacity.toString());
-      formData.append("rotation", rotation.toString());
-      formData.append("spacing", spacing.toString());
+    // Reset all statuses to processing
+    setImages((prev) =>
+      prev.map((img) => ({
+        ...img,
+        status: STATUS.PROCESSING,
+        resultUrl: img.resultUrl ? (URL.revokeObjectURL(img.resultUrl), null) : null,
+        resultBlob: null,
+        error: null,
+      }))
+    );
 
-      const response = await fetch("/api/watermark", {
-        method: "POST",
-        body: formData,
-      });
+    // Process all images in parallel (max 3 concurrent to avoid overwhelming the server)
+    const CONCURRENCY = 3;
+    const queue = [...images];
+    const processing = new Set();
 
-      if (!response.ok) {
-        const data = await response.json().catch(() => null);
-        throw new Error(data?.error || `Server error (${response.status})`);
+    const processNext = async () => {
+      if (queue.length === 0) return;
+
+      const img = queue.shift();
+      processing.add(img.id);
+
+      try {
+        const { url, blob } = await processOneImage(img);
+        setImages((prev) =>
+          prev.map((i) =>
+            i.id === img.id
+              ? { ...i, resultUrl: url, resultBlob: blob, status: STATUS.DONE, error: null }
+              : i
+          )
+        );
+      } catch (err) {
+        setImages((prev) =>
+          prev.map((i) =>
+            i.id === img.id
+              ? { ...i, status: STATUS.ERROR, error: err.message }
+              : i
+          )
+        );
+      } finally {
+        processing.delete(img.id);
+        await processNext(); // Process next in queue
       }
+    };
 
-      // Read the response as a blob and create an object URL
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      setResultUrl(url);
-    } catch (err) {
-      setError(err.message || "Something went wrong. Please try again.");
-    } finally {
-      setLoading(false);
+    // Start up to CONCURRENCY workers
+    const workers = [];
+    for (let i = 0; i < Math.min(CONCURRENCY, queue.length); i++) {
+      workers.push(processNext());
     }
+
+    await Promise.all(workers);
+    setIsProcessing(false);
   };
 
-  // --- Download ---
-  const handleDownload = () => {
-    if (!resultUrl) return;
-
+  // --- Download single image ---
+  const downloadOne = (img) => {
+    if (!img.resultUrl) return;
     const link = document.createElement("a");
-    link.href = resultUrl;
-
-    // Determine extension from original file
-    const ext = file?.name?.split(".").pop() || "png";
-    link.download = `watermarked-image.${ext}`;
-
+    link.href = img.resultUrl;
+    const ext = img.file.name.split(".").pop() || "png";
+    link.download = `watermarked-${img.file.name}`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  // --- Download All as ZIP ---
+  const downloadAllAsZip = async () => {
+    const doneImages = images.filter((i) => i.status === STATUS.DONE && i.resultBlob);
+    if (doneImages.length === 0) return;
+
+    setIsZipping(true);
+
+    try {
+      const zip = new JSZip();
+
+      for (const img of doneImages) {
+        const ext = img.file.name.split(".").pop() || "png";
+        const baseName = img.file.name.replace(/\.[^/.]+$/, "");
+        const fileName = `watermarked-${baseName}.${ext}`;
+        zip.file(fileName, img.resultBlob);
+      }
+
+      const content = await zip.generateAsync({ type: "blob" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(content);
+      link.download = "watermarked-images.zip";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+    } catch {
+      setError("Failed to create ZIP file.");
+    } finally {
+      setIsZipping(false);
+    }
   };
 
   // --- Helpers ---
@@ -145,7 +265,10 @@ export default function Home() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const isReady = file && watermarkText.trim().length > 0;
+  const isReady = images.length > 0 && watermarkText.trim().length > 0;
+  const doneCount = images.filter((i) => i.status === STATUS.DONE).length;
+  const errorCount = images.filter((i) => i.status === STATUS.ERROR).length;
+  const processedCount = doneCount + errorCount;
 
   return (
     <main className="app-container">
@@ -156,7 +279,7 @@ export default function Home() {
         </span>
         <h1 className="header__title">Watermark Studio</h1>
         <p className="header__subtitle">
-          Professional diagonal watermarks for your images
+          Professional diagonal watermarks — batch process multiple images
         </p>
       </header>
 
@@ -172,68 +295,103 @@ export default function Home() {
       <section className="card fade-in" style={{ animationDelay: "0.1s" }}>
         <div className="card__title">
           <span className="card__title-icon">📁</span>
-          Upload Image
+          Upload Images
+          {images.length > 0 && (
+            <span className="badge">{images.length} file{images.length > 1 ? "s" : ""}</span>
+          )}
         </div>
 
         <div
-          className={`upload-zone ${isDragActive ? "upload-zone--active" : ""} ${file ? "upload-zone--has-file" : ""}`}
+          className={`upload-zone ${isDragActive ? "upload-zone--active" : ""} ${images.length > 0 ? "upload-zone--has-file" : ""}`}
           onDragEnter={handleDragEnter}
           onDragLeave={handleDragLeave}
           onDragOver={handleDragOver}
           onDrop={handleDrop}
           id="upload-zone"
         >
-          {!file ? (
-            <>
-              <span className="upload-zone__icon">🖼️</span>
-              <p className="upload-zone__text">
-                Drag & drop your image here, or click to browse
-              </p>
-              <p className="upload-zone__hint">
-                Supports JPEG, PNG, WebP, GIF, TIFF, AVIF • Max 10MB
-              </p>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/jpeg,image/png,image/webp,image/gif,image/tiff,image/avif"
-                onChange={handleFileInputChange}
-                className="upload-zone__input"
-                id="file-input"
-                aria-label="Upload image file"
-              />
-            </>
-          ) : (
-            <>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/jpeg,image/png,image/webp,image/gif,image/tiff,image/avif"
-                onChange={handleFileInputChange}
-                className="upload-zone__input"
-                id="file-input"
-                aria-label="Upload image file"
-              />
-              <div className="file-info">
-                <span className="file-info__icon">🖼️</span>
-                <div className="file-info__details">
-                  <div className="file-info__name">{file.name}</div>
-                  <div className="file-info__size">{formatFileSize(file.size)}</div>
-                </div>
-                <button
-                  className="file-info__remove"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleRemoveFile();
-                  }}
-                  aria-label="Remove file"
-                  id="remove-file-btn"
-                >
-                  ✕
-                </button>
-              </div>
-            </>
-          )}
+          <span className="upload-zone__icon">🖼️</span>
+          <p className="upload-zone__text">
+            {images.length === 0
+              ? "Drag & drop images here, or click to browse"
+              : "Drop more images or click to add"
+            }
+          </p>
+          <p className="upload-zone__hint">
+            Supports JPEG, PNG, WebP, GIF, TIFF, AVIF • Max 10MB each • Multiple files
+          </p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/jpeg,image/png,image/webp,image/gif,image/tiff,image/avif"
+            onChange={handleFileInputChange}
+            className="upload-zone__input"
+            id="file-input"
+            aria-label="Upload image files"
+            multiple
+          />
         </div>
+
+        {/* File List */}
+        {images.length > 0 && (
+          <div className="file-list">
+            {images.map((img) => (
+              <div key={img.id} className={`file-item file-item--${img.status}`}>
+                <img
+                  src={img.originalUrl}
+                  alt={img.file.name}
+                  className="file-item__thumb"
+                />
+                <div className="file-item__details">
+                  <div className="file-item__name">{img.file.name}</div>
+                  <div className="file-item__meta">
+                    <span>{formatFileSize(img.file.size)}</span>
+                    {img.status === STATUS.PROCESSING && (
+                      <span className="file-item__status file-item__status--processing">
+                        <span className="spinner-sm"></span> Processing...
+                      </span>
+                    )}
+                    {img.status === STATUS.DONE && (
+                      <span className="file-item__status file-item__status--done">✓ Done</span>
+                    )}
+                    {img.status === STATUS.ERROR && (
+                      <span className="file-item__status file-item__status--error">✕ {img.error}</span>
+                    )}
+                  </div>
+                </div>
+                <div className="file-item__actions">
+                  {img.status === STATUS.DONE && (
+                    <button
+                      className="file-item__btn file-item__btn--download"
+                      onClick={() => downloadOne(img)}
+                      title="Download"
+                    >
+                      ⬇️
+                    </button>
+                  )}
+                  <button
+                    className="file-item__btn file-item__btn--remove"
+                    onClick={() => removeImage(img.id)}
+                    title="Remove"
+                    disabled={isProcessing}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ))}
+
+            <div className="file-list__footer">
+              <button
+                className="btn-text"
+                onClick={clearAll}
+                disabled={isProcessing}
+                id="clear-all-btn"
+              >
+                Clear All
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       {/* --- Watermark Settings Card --- */}
@@ -323,81 +481,96 @@ export default function Home() {
         </div>
       </section>
 
-      {/* --- Apply Button --- */}
-      <div className="fade-in" style={{ animationDelay: "0.3s", marginBottom: "24px" }}>
+      {/* --- Action Buttons --- */}
+      <div className="action-bar fade-in" style={{ animationDelay: "0.3s" }}>
         <button
           className="btn-primary"
-          onClick={handleSubmit}
-          disabled={!isReady || loading}
+          onClick={handleProcessAll}
+          disabled={!isReady || isProcessing}
           id="apply-btn"
         >
-          {loading ? (
+          {isProcessing ? (
             <>
               <span className="spinner"></span>
-              <span>Processing...</span>
+              <span>Processing {processedCount}/{images.length}...</span>
             </>
           ) : (
             <>
               <span>✨</span>
-              <span>Apply Watermark</span>
+              <span>
+                Apply Watermark{images.length > 1 ? ` to ${images.length} Images` : ""}
+              </span>
             </>
           )}
         </button>
+
+        {doneCount > 1 && (
+          <button
+            className="btn-download"
+            onClick={downloadAllAsZip}
+            disabled={isZipping}
+            id="download-all-btn"
+          >
+            {isZipping ? (
+              <>
+                <span className="spinner-sm"></span>
+                <span>Creating ZIP...</span>
+              </>
+            ) : (
+              <>
+                <span>📦</span>
+                <span>Download All as ZIP ({doneCount} images)</span>
+              </>
+            )}
+          </button>
+        )}
       </div>
 
-      {/* --- Preview / Result --- */}
-      {(originalPreview || resultUrl) && (
+      {/* --- Results Gallery --- */}
+      {images.some((i) => i.status === STATUS.DONE) && (
         <section className="card fade-in" style={{ animationDelay: "0.1s" }}>
           <div className="card__title">
             <span className="card__title-icon">👁️</span>
-            Preview
+            Results
+            <span className="badge">{doneCount} of {images.length}</span>
+            {errorCount > 0 && <span className="badge badge--error">{errorCount} failed</span>}
           </div>
 
-          <div className="preview-container">
-            {/* Original */}
-            {originalPreview && (
-              <div className="preview-item">
-                <div className="preview-label">Original</div>
-                <div className="preview-image-wrapper">
-                  <img
-                    src={originalPreview}
-                    alt="Original uploaded image"
-                    className="preview-image"
-                    id="original-preview"
-                  />
+          <div className="results-grid">
+            {images
+              .filter((i) => i.status === STATUS.DONE)
+              .map((img) => (
+                <div key={img.id} className="result-card">
+                  <div className="result-card__comparison">
+                    <div className="result-card__image-wrap">
+                      <div className="result-card__label">Original</div>
+                      <img
+                        src={img.originalUrl}
+                        alt={`Original ${img.file.name}`}
+                        className="result-card__image"
+                      />
+                    </div>
+                    <div className="result-card__image-wrap">
+                      <div className="result-card__label">Watermarked</div>
+                      <img
+                        src={img.resultUrl}
+                        alt={`Watermarked ${img.file.name}`}
+                        className="result-card__image"
+                      />
+                    </div>
+                  </div>
+                  <div className="result-card__footer">
+                    <span className="result-card__name">{img.file.name}</span>
+                    <button
+                      className="btn-download-sm"
+                      onClick={() => downloadOne(img)}
+                    >
+                      ⬇️ Download
+                    </button>
+                  </div>
                 </div>
-              </div>
-            )}
-
-            {/* Watermarked */}
-            {resultUrl && (
-              <div className="preview-item">
-                <div className="preview-label">Watermarked</div>
-                <div className="preview-image-wrapper">
-                  <img
-                    src={resultUrl}
-                    alt="Watermarked result image"
-                    className="preview-image"
-                    id="result-preview"
-                  />
-                </div>
-              </div>
-            )}
+              ))}
           </div>
-
-          {/* Download Button */}
-          {resultUrl && (
-            <div style={{ marginTop: "24px" }}>
-              <button
-                className="btn-download"
-                onClick={handleDownload}
-                id="download-btn"
-              >
-                <span>⬇️</span>
-                <span>Download Watermarked Image</span>
-              </button>
-            </div>
-          )}
         </section>
       )}
 
