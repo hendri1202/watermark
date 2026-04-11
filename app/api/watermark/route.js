@@ -1,5 +1,7 @@
 import sharp from "sharp";
 import { NextResponse } from "next/server";
+import fs from "fs";
+import path from "path";
 
 /**
  * Escape special XML characters to prevent SVG injection.
@@ -31,6 +33,42 @@ function escapeXml(text) {
  *   serverless environments.
  * - SVG patterns provide precise control over repetition and rotation.
  */
+/**
+ * Load the embedded Inter Bold font as a Base64 data URI.
+ *
+ * Vercel's serverless runtime (which uses librsvg via Sharp) does NOT have
+ * access to system fonts like Arial or Helvetica. Without an embedded font,
+ * librsvg falls back to a built-in font that may not have the glyphs for
+ * the user's text, resulting in tofu (□□□) squares being rendered.
+ *
+ * Solution: read a woff font file shipped with the project and embed it
+ * directly in the SVG <style> block as a base64 data URI. librsvg supports
+ * woff-embedded @font-face declarations, so this works reliably on Vercel.
+ */
+function loadFontBase64() {
+  try {
+    // process.cwd() resolves to the project root in both local dev and Vercel.
+    const fontPath = path.join(process.cwd(), "public", "fonts", "Inter-Bold.woff");
+    const fontBuffer = fs.readFileSync(fontPath);
+    return fontBuffer.toString("base64");
+  } catch (err) {
+    // If the font file is missing, fall back gracefully (text may still render
+    // on some systems, but log a warning for debugging).
+    console.warn("[watermark] Could not load embedded font:", err.message);
+    return null;
+  }
+}
+
+// Cache the base64 string at module level so we only read the file once
+// per cold start (Vercel reuses the module across requests in a container).
+let _fontBase64 = undefined;
+function getCachedFontBase64() {
+  if (_fontBase64 === undefined) {
+    _fontBase64 = loadFontBase64();
+  }
+  return _fontBase64;
+}
+
 function generateWatermarkSvg({ width, height, text, opacity, rotation, spacing }) {
   const safeText = escapeXml(text);
 
@@ -46,8 +84,24 @@ function generateWatermarkSvg({ width, height, text, opacity, rotation, spacing 
   const offsetX = -width;
   const offsetY = -height;
 
+  // Build an @font-face block if the font was loaded successfully.
+  // This embeds the font binary directly in the SVG so librsvg (used by
+  // Sharp on Vercel) can render the text without needing system fonts.
+  const fontBase64 = getCachedFontBase64();
+  const fontFaceBlock = fontBase64
+    ? `<style>
+        @font-face {
+          font-family: 'InterWatermark';
+          font-weight: 700;
+          src: url('data:font/woff;base64,${fontBase64}') format('woff');
+        }
+      </style>`
+    : "";
+  const fontFamily = fontBase64 ? "InterWatermark" : "Arial, Helvetica, sans-serif";
+
   return `
     <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+      ${fontFaceBlock}
       <defs>
         <pattern
           id="watermarkPattern"
@@ -65,7 +119,7 @@ function generateWatermarkSvg({ width, height, text, opacity, rotation, spacing 
             x="${spacing / 2}"
             y="${spacing / 2}"
             font-size="${fontSize}"
-            font-family="Arial, Helvetica, sans-serif"
+            font-family="${fontFamily}"
             font-weight="bold"
             fill="rgba(255, 255, 255, ${opacity})"
             text-anchor="middle"
