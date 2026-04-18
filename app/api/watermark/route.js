@@ -2,6 +2,7 @@ import sharp from "sharp";
 import { NextResponse } from "next/server";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import opentype from "opentype.js";
 
 export const runtime = "nodejs";
 
@@ -50,7 +51,96 @@ function getCachedFontPath() {
   return _fontPath;
 }
 
-async function renderTextBufferWithFallback({ markupText, width, height, fontPath }) {
+let _outlineFont = undefined;
+
+function loadOutlineFont() {
+  const fontPath = getCachedFontPath();
+  if (!fontPath) {
+    return null;
+  }
+
+  try {
+    const fontBuffer = fs.readFileSync(fontPath);
+    const arrayBuffer = fontBuffer.buffer.slice(
+      fontBuffer.byteOffset,
+      fontBuffer.byteOffset + fontBuffer.byteLength,
+    );
+    return opentype.parse(arrayBuffer);
+  } catch (err) {
+    console.warn("[watermark] Failed to parse outline font:", err.message);
+    return null;
+  }
+}
+
+function getCachedOutlineFont() {
+  if (_outlineFont === undefined) {
+    _outlineFont = loadOutlineFont();
+  }
+
+  return _outlineFont;
+}
+
+function canFontRenderText(font, text) {
+  const glyphs = font.stringToGlyphs(text);
+  return !glyphs.some((glyph) => glyph?.name === ".notdef");
+}
+
+function buildTextPath(font, text, fontSize) {
+  const baselineY = (font.ascender * fontSize) / font.unitsPerEm;
+  const path = font.getPath(text, 0, baselineY, fontSize, { kerning: true });
+  const bbox = path.getBoundingBox();
+  const width = Math.max(1, Math.ceil(bbox.x2 - bbox.x1));
+  const height = Math.max(1, Math.ceil(bbox.y2 - bbox.y1));
+
+  return {
+    pathData: path.toPathData(2),
+    bbox,
+    width,
+    height,
+  };
+}
+
+async function renderTextBufferFromOutline({ text, opacity, spacing }) {
+  const font = getCachedOutlineFont();
+  if (!font || !canFontRenderText(font, text)) {
+    return null;
+  }
+
+  let fontSize = Math.max(14, Math.round(spacing * 0.12));
+  let pathInfo = buildTextPath(font, text, fontSize);
+
+  const targetMaxWidth = Math.max(120, Math.round(spacing * 0.9));
+  if (pathInfo.width > targetMaxWidth) {
+    const scale = targetMaxWidth / pathInfo.width;
+    fontSize = Math.max(10, Math.floor(fontSize * scale));
+    pathInfo = buildTextPath(font, text, fontSize);
+  }
+
+  const paddingX = Math.max(8, Math.round(spacing * 0.08));
+  const paddingY = Math.max(6, Math.round(spacing * 0.06));
+  const svgWidth = pathInfo.width + paddingX * 2;
+  const svgHeight = pathInfo.height + paddingY * 2;
+  const fillColor = `#808080${alphaToHex(opacity)}`;
+
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">
+      <path
+        d="${pathInfo.pathData}"
+        fill="${fillColor}"
+        transform="translate(${paddingX - pathInfo.bbox.x1} ${paddingY - pathInfo.bbox.y1})"
+      />
+    </svg>
+  `.trim();
+
+  return sharp(Buffer.from(svg)).png().toBuffer();
+}
+
+async function renderTextBufferWithFallback({
+  markupText,
+  width,
+  height,
+  fontPath,
+}) {
   const attemptOptions = [
     {
       font: "Inter 700",
@@ -92,9 +182,9 @@ async function renderTextBufferWithFallback({ markupText, width, height, fontPat
     }
   }
 
-  throw (lastError instanceof Error
+  throw lastError instanceof Error
     ? lastError
-    : new Error("Failed to render watermark text."));
+    : new Error("Failed to render watermark text.");
 }
 
 /**
@@ -110,12 +200,21 @@ async function createWatermarkTileBuffer({ text, opacity, rotation, spacing }) {
   const fontPath = getCachedFontPath();
   const textColor = `#808080${alphaToHex(opacity)}`;
 
-  const textBuffer = await renderTextBufferWithFallback({
-    markupText: `<span foreground="${textColor}">${safeText}</span>`,
-    fontPath,
-    width: Math.max(120, Math.round(spacing * 0.9)),
-    height: Math.max(48, Math.round(spacing * 0.42)),
+  // Prefer outline paths so glyph rendering is not dependent on server fonts.
+  let textBuffer = await renderTextBufferFromOutline({
+    text,
+    opacity,
+    spacing,
   });
+
+  if (!textBuffer) {
+    textBuffer = await renderTextBufferWithFallback({
+      markupText: `<span foreground="${textColor}">${safeText}</span>`,
+      fontPath,
+      width: Math.max(120, Math.round(spacing * 0.9)),
+      height: Math.max(48, Math.round(spacing * 0.42)),
+    });
+  }
 
   const rotatedTextBuffer = await sharp(textBuffer)
     .rotate(rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
