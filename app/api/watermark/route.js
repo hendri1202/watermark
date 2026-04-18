@@ -1,7 +1,7 @@
 import sharp from "sharp";
 import { NextResponse } from "next/server";
 import fs from "fs";
-import path from "path";
+import { fileURLToPath } from "url";
 
 /**
  * Escape special XML characters to prevent SVG injection.
@@ -16,123 +16,139 @@ function escapeXml(text) {
     .replace(/'/g, "&apos;");
 }
 
-/**
- * Generate a tiled, diagonal watermark SVG string.
- *
- * How it works:
- * - We use an SVG <pattern> element to create a repeating tile.
- * - The pattern contains a <text> element with the user's watermark text.
- * - `patternTransform="rotate(...)"` rotates the entire pattern to create
- *   a diagonal effect across the image.
- * - The pattern is applied to a full-size <rect> that covers the entire image.
- * - Opacity is controlled via the `fill` color's alpha channel.
- *
- * Why SVG?
- * - SVG is rendered natively by Sharp (via librsvg), no need for node-canvas
- *   or OS-level dependencies. This makes it fully compatible with Vercel
- *   serverless environments.
- * - SVG patterns provide precise control over repetition and rotation.
- */
-/**
- * Load the embedded Inter Bold font as a Base64 data URI.
- *
- * Vercel's serverless runtime (which uses librsvg via Sharp) does NOT have
- * access to system fonts like Arial or Helvetica. Without an embedded font,
- * librsvg falls back to a built-in font that may not have the glyphs for
- * the user's text, resulting in tofu (□□□) squares being rendered.
- *
- * Solution: read a woff font file shipped with the project and embed it
- * directly in the SVG <style> block as a base64 data URI. librsvg supports
- * woff-embedded @font-face declarations, so this works reliably on Vercel.
- */
-function loadFontBase64() {
-  try {
-    // process.cwd() resolves to the project root in both local dev and Vercel.
-    const fontPath = path.join(process.cwd(), "public", "fonts", "Inter-Bold.woff");
-    const fontBuffer = fs.readFileSync(fontPath);
-    return fontBuffer.toString("base64");
-  } catch (err) {
-    // If the font file is missing, fall back gracefully (text may still render
-    // on some systems, but log a warning for debugging).
-    console.warn("[watermark] Could not load embedded font:", err.message);
-    return null;
-  }
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
-// Cache the base64 string at module level so we only read the file once
-// per cold start (Vercel reuses the module across requests in a container).
-let _fontBase64 = undefined;
-function getCachedFontBase64() {
-  if (_fontBase64 === undefined) {
-    _fontBase64 = loadFontBase64();
-  }
-  return _fontBase64;
+function alphaToHex(alpha) {
+  return Math.round(clamp(alpha, 0, 1) * 255)
+    .toString(16)
+    .padStart(2, "0")
+    .toUpperCase();
 }
 
-function generateWatermarkSvg({ width, height, text, opacity, rotation, spacing }) {
+function resolveFontPath() {
+  const candidates = [
+    fileURLToPath(
+      new URL("../../../public/fonts/Inter-Bold.woff", import.meta.url),
+    ),
+    fileURLToPath(
+      new URL("../../../public/fonts/Inter-Bold.woff2", import.meta.url),
+    ),
+    fileURLToPath(
+      new URL(
+        "../../../node_modules/@fontsource/inter/files/inter-latin-700-normal.woff",
+        import.meta.url,
+      ),
+    ),
+    fileURLToPath(
+      new URL(
+        "../../../node_modules/@fontsource/inter/files/inter-latin-700-normal.woff2",
+        import.meta.url,
+      ),
+    ),
+  ];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+let _fontPath = undefined;
+function getCachedFontPath() {
+  if (_fontPath === undefined) {
+    _fontPath = resolveFontPath();
+    if (!_fontPath) {
+      console.warn(
+        "[watermark] No local font file found. Falling back to server fonts.",
+      );
+    }
+  }
+  return _fontPath;
+}
+
+/**
+ * Create a single transparent tile (PNG) containing rotated text.
+ *
+ * Why this approach:
+ * - Sharp/librsvg on serverless may not honor embedded SVG fonts consistently.
+ * - We render text directly via Sharp's text input with `fontfile`, then tile
+ *   that image in SVG. This avoids runtime dependence on system fonts.
+ */
+async function createWatermarkTileBuffer({ text, opacity, rotation, spacing }) {
   const safeText = escapeXml(text);
-
-  // Font size scales relative to spacing so text looks proportional
+  const fontPath = getCachedFontPath();
   const fontSize = Math.max(14, Math.round(spacing * 0.12));
+  const textColor = `#808080${alphaToHex(opacity)}`;
 
-  // We make the SVG much larger than the image to ensure full coverage
-  // even after rotation. This prevents empty corners.
+  const textBuffer = await sharp({
+    text: {
+      text: `<span foreground="${textColor}">${safeText}</span>`,
+      font: "Inter 700",
+      ...(fontPath ? { fontfile: fontPath } : {}),
+      width: Math.max(120, Math.round(spacing * 0.9)),
+      height: Math.max(48, Math.round(spacing * 0.42)),
+      align: "center",
+      rgba: true,
+      dpi: 192,
+    },
+  })
+    .png()
+    .toBuffer();
+
+  const rotatedTextBuffer = await sharp(textBuffer)
+    .rotate(rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png()
+    .toBuffer();
+
+  return sharp({
+    create: {
+      width: spacing,
+      height: spacing,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite([
+      {
+        input: rotatedTextBuffer,
+        gravity: "center",
+      },
+    ])
+    .png()
+    .toBuffer();
+}
+
+function generateWatermarkSvg({ width, height, spacing, tileBase64 }) {
   const svgWidth = width * 3;
   const svgHeight = height * 3;
-
-  // Offset the rect so the pattern covers beyond all edges
   const offsetX = -width;
   const offsetY = -height;
 
-  // Build an @font-face block if the font was loaded successfully.
-  // This embeds the font binary directly in the SVG so librsvg (used by
-  // Sharp on Vercel) can render the text without needing system fonts.
-  const fontBase64 = getCachedFontBase64();
-  const fontFaceBlock = fontBase64
-    ? `<style>
-        @font-face {
-          font-family: 'InterWatermark';
-          font-weight: 700;
-          src: url('data:font/woff;base64,${fontBase64}') format('woff');
-        }
-      </style>`
-    : "";
-  const fontFamily = fontBase64 ? "InterWatermark" : "Arial, Helvetica, sans-serif";
-
   return `
     <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
-      ${fontFaceBlock}
       <defs>
         <pattern
           id="watermarkPattern"
           patternUnits="userSpaceOnUse"
           width="${spacing}"
           height="${spacing}"
-          patternTransform="rotate(${rotation})"
         >
-          <!--
-            Each tile contains the watermark text, centered within the tile.
-            The text uses a semi-transparent white fill for visibility on
-            both light and dark images.
-          -->
-          <text
-            x="${spacing / 2}"
-            y="${spacing / 2}"
-            font-size="${fontSize}"
-            font-family="${fontFamily}"
-            font-weight="bold"
-            fill="rgba(255, 255, 255, ${opacity})"
-            text-anchor="middle"
-            dominant-baseline="middle"
-            letter-spacing="2"
-          >${safeText}</text>
+          <image
+            href="data:image/png;base64,${tileBase64}"
+            x="0"
+            y="0"
+            width="${spacing}"
+            height="${spacing}"
+            preserveAspectRatio="none"
+          />
         </pattern>
       </defs>
 
-      <!--
-        A large rect filled with the repeating pattern.
-        Oversized and offset to guarantee complete coverage after rotation.
-      -->
       <rect
         x="${offsetX}"
         y="${offsetY}"
@@ -167,14 +183,14 @@ export async function POST(request) {
     if (!imageFile || !(imageFile instanceof File)) {
       return NextResponse.json(
         { error: "No image file uploaded. Please select an image." },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
     if (!text || typeof text !== "string" || text.trim().length === 0) {
       return NextResponse.json(
         { error: "Watermark text is required. Please enter some text." },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -183,14 +199,23 @@ export async function POST(request) {
     if (imageFile.size > MAX_SIZE) {
       return NextResponse.json(
         { error: "Image is too large. Maximum size is 10MB." },
-        { status: 413 }
+        { status: 413 },
       );
     }
 
     // Parse optional parameters with validation and defaults
-    const opacity = Math.min(0.50, Math.max(0.05, parseFloat(formData.get("opacity")) || 0.15));
-    const rotation = Math.min(0, Math.max(-60, parseFloat(formData.get("rotation")) || -30));
-    const spacing = Math.min(400, Math.max(100, parseInt(formData.get("spacing")) || 200));
+    const opacity = Math.min(
+      0.5,
+      Math.max(0.05, parseFloat(formData.get("opacity")) || 0.15),
+    );
+    const rotation = Math.min(
+      0,
+      Math.max(-60, parseFloat(formData.get("rotation")) || -30),
+    );
+    const spacing = Math.min(
+      400,
+      Math.max(100, parseInt(formData.get("spacing")) || 200),
+    );
 
     // --- 2. Read the uploaded image into a buffer ---
     const arrayBuffer = await imageFile.arrayBuffer();
@@ -202,19 +227,26 @@ export async function POST(request) {
 
     if (!width || !height) {
       return NextResponse.json(
-        { error: "Could not read image dimensions. The file may be corrupted." },
-        { status: 400 }
+        {
+          error: "Could not read image dimensions. The file may be corrupted.",
+        },
+        { status: 400 },
       );
     }
 
-    // --- 4. Generate the SVG watermark overlay ---
-    const svgWatermark = generateWatermarkSvg({
-      width,
-      height,
+    // --- 4. Build a text tile and generate the SVG watermark overlay ---
+    const tileBuffer = await createWatermarkTileBuffer({
       text: text.trim(),
       opacity,
       rotation,
       spacing,
+    });
+
+    const svgWatermark = generateWatermarkSvg({
+      width,
+      height,
+      spacing,
+      tileBase64: tileBuffer.toString("base64"),
     });
 
     // --- 5. Composite the SVG watermark onto the original image ---
@@ -259,7 +291,7 @@ export async function POST(request) {
     console.error("Watermark processing error:", error);
     return NextResponse.json(
       { error: "Failed to process image. Please try a different file." },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

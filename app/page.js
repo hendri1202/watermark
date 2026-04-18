@@ -22,7 +22,7 @@ export default function Home() {
   // Each image entry: { id, file, originalUrl, resultUrl, resultBlob, status, error }
   const [images, setImages] = useState([]);
   const [watermarkText, setWatermarkText] = useState("");
-  const [opacity, setOpacity] = useState(0.15);
+  const [opacity, setOpacity] = useState(0.10);
   const [rotation, setRotation] = useState(-30);
   const [spacing, setSpacing] = useState(200);
   const [isProcessing, setIsProcessing] = useState(false);
