@@ -33,9 +33,6 @@ function resolveFontPath() {
       new URL("../../../public/fonts/Inter-Bold.woff", import.meta.url),
     ),
     fileURLToPath(
-      new URL("../../../public/fonts/Inter-Bold.woff2", import.meta.url),
-    ),
-    fileURLToPath(
       new URL(
         "../../../node_modules/@fontsource/inter/files/inter-latin-700-normal.woff",
         import.meta.url,
@@ -43,7 +40,7 @@ function resolveFontPath() {
     ),
     fileURLToPath(
       new URL(
-        "../../../node_modules/@fontsource/inter/files/inter-latin-700-normal.woff2",
+        "../../../node_modules/@fontsource/inter/files/inter-latin-ext-700-normal.woff",
         import.meta.url,
       ),
     ),
