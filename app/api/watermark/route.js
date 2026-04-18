@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import fs from "fs";
 import { fileURLToPath } from "url";
 
+export const runtime = "nodejs";
+
 /**
  * Escape special XML characters to prevent SVG injection.
  * This ensures user-provided text is safe to embed inside SVG markup.
@@ -28,31 +30,11 @@ function alphaToHex(alpha) {
 }
 
 function resolveFontPath() {
-  const candidates = [
-    fileURLToPath(
-      new URL("../../../public/fonts/Inter-Bold.woff", import.meta.url),
-    ),
-    fileURLToPath(
-      new URL(
-        "../../../node_modules/@fontsource/inter/files/inter-latin-700-normal.woff",
-        import.meta.url,
-      ),
-    ),
-    fileURLToPath(
-      new URL(
-        "../../../node_modules/@fontsource/inter/files/inter-latin-ext-700-normal.woff",
-        import.meta.url,
-      ),
-    ),
-  ];
+  const bundledFontPath = fileURLToPath(
+    new URL("../../../public/fonts/Inter-Bold.woff", import.meta.url),
+  );
 
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return null;
+  return fs.existsSync(bundledFontPath) ? bundledFontPath : null;
 }
 
 let _fontPath = undefined;
@@ -68,6 +50,53 @@ function getCachedFontPath() {
   return _fontPath;
 }
 
+async function renderTextBufferWithFallback({ markupText, width, height, fontPath }) {
+  const attemptOptions = [
+    {
+      font: "Inter 700",
+      ...(fontPath ? { fontfile: fontPath } : {}),
+      width,
+      height,
+      align: "center",
+      rgba: true,
+    },
+    {
+      font: "sans 700",
+      width,
+      height,
+      align: "center",
+      rgba: true,
+    },
+    {
+      width,
+      height,
+      align: "center",
+      rgba: true,
+    },
+  ];
+
+  let lastError = null;
+
+  for (const textOptions of attemptOptions) {
+    try {
+      return await sharp({
+        text: {
+          text: markupText,
+          ...textOptions,
+        },
+      })
+        .png()
+        .toBuffer();
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw (lastError instanceof Error
+    ? lastError
+    : new Error("Failed to render watermark text."));
+}
+
 /**
  * Create a single transparent tile (PNG) containing rotated text.
  *
@@ -79,22 +108,14 @@ function getCachedFontPath() {
 async function createWatermarkTileBuffer({ text, opacity, rotation, spacing }) {
   const safeText = escapeXml(text);
   const fontPath = getCachedFontPath();
-  const fontSize = Math.max(14, Math.round(spacing * 0.12));
   const textColor = `#808080${alphaToHex(opacity)}`;
 
-  const textBuffer = await sharp({
-    text: {
-      text: `<span foreground="${textColor}">${safeText}</span>`,
-      font: "Inter 700",
-      ...(fontPath ? { fontfile: fontPath } : {}),
-      width: Math.max(120, Math.round(spacing * 0.9)),
-      height: Math.max(48, Math.round(spacing * 0.42)),
-      align: "center",
-      rgba: true,
-    },
-  })
-    .png()
-    .toBuffer();
+  const textBuffer = await renderTextBufferWithFallback({
+    markupText: `<span foreground="${textColor}">${safeText}</span>`,
+    fontPath,
+    width: Math.max(120, Math.round(spacing * 0.9)),
+    height: Math.max(48, Math.round(spacing * 0.42)),
+  });
 
   const rotatedTextBuffer = await sharp(textBuffer)
     .rotate(rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
@@ -284,9 +305,13 @@ export async function POST(request) {
       },
     });
   } catch (error) {
-    console.error("Watermark processing error:", error);
+    const message =
+      error instanceof Error ? error.message : "Unknown server error.";
+
+    console.error("Watermark processing error:", message, error);
+
     return NextResponse.json(
-      { error: "Failed to process image. Please try a different file." },
+      { error: `Failed to process image: ${message}` },
       { status: 500 },
     );
   }
