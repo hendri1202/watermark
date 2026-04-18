@@ -91,7 +91,6 @@ async function createWatermarkTileBuffer({ text, opacity, rotation, spacing }) {
       height: Math.max(48, Math.round(spacing * 0.42)),
       align: "center",
       rgba: true,
-      dpi: 192,
     },
   })
     .png()
